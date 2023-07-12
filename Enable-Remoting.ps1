@@ -1,441 +1,454 @@
-<#
-The MIT License (MIT)
- 
-Copyright (c) 2015 Objectivity Bespoke Software Specialists
- 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
- 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
- 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-#>
+#!powershell
+#Requires -Version 3.0
 
-function Enable-Remoting {
+# Configure a Windows host for remote management with Ansible
+# -----------------------------------------------------------
+#
+# This script checks the current WinRM (PS Remoting) configuration and makes
+# the necessary changes to allow Ansible to connect, authenticate and
+# execute PowerShell commands.
+#
+# All events are logged to the Windows EventLog, useful for unattended runs.
+#
+# Use option -Verbose in order to see the verbose output messages.
+#
+# Use option -CertValidityDays to specify how long this certificate is valid
+# starting from today. So you would specify -CertValidityDays 3650 to get
+# a 10-year valid certificate.
+#
+# Use option -ForceNewSSLCert if the system has been SysPreped and a new
+# SSL Certificate must be forced on the WinRM Listener when re-running this
+# script. This is necessary when a new SID and CN name is created.
+#
+# Use option -EnableCredSSP to enable CredSSP as an authentication option.
+#
+# Use option -DisableBasicAuth to disable basic authentication.
+#
+# Use option -SkipNetworkProfileCheck to skip the network profile check.
+# Without specifying this the script will only run if the device's interfaces
+# are in DOMAIN or PRIVATE zones.  Provide this switch if you want to enable
+# WinRM on a device with an interface in PUBLIC zone.
+#
+# Use option -SubjectName to specify the CN name of the certificate. This
+# defaults to the system's hostname and generally should not be specified.
 
-    <#
-    .SYNOPSIS
-    Configures PSRemoting on local computer.
- 
-    .DESCRIPTION
-    Based on script for Ansible written by Trond Hindenes <trond@hindenes.com> (Version 1.0 - July 6th, 2014)
-    https://github.com/ansible/ansible/blob/devel/examples/scripts/ConfigureRemotingForAnsible.ps1
-     
-    .PARAMETER AuthTypes
-    Types of authentication to test (note CredSSP here is for server role).
-    - Default - Negotiate (Kerberos/NTLM)
-    - Basic - authentication using local user (domain credentials will not work)
-    - CredSSP - allows to delegate domain credentials without Kerberos (useful for double hop).
- 
-    .PARAMETER Protocols
-    Protocols to configure.
- 
-    .PARAMETER CredSSPClientDelegateComputer
-    If not empty, CredSSP client role will be enabled with DelegateComputer set to value of this parameter.
- 
-    .PARAMETER CertSelfSigned
-    If true and HTTPS is configured, a self-signed certificate will be created. Note it's validity is 365 days.
- 
-    .PARAMETER CertThumbprint
-    Thumbprint of certificate to import (if AuthTypes contains HTTPS and CertSelfSigned is false).
- 
-    .PARAMETER CertSubjectName
-    Subject name for the certificate (if AuthTypes contains HTTPS). It must be the same string as the one used to connect to this server.
-    For example if you're going to run Invoke-Command -ComputerName 192.168.1.50, subject name must be 192.168.1.50.
- 
-    .EXAMPLE
-    Enable-Remoting
- 
-    Configures CredSSP/Default on HTTP and HTTPS protocols using self-signed certificate with subject name = $env:COMPUTERNAME.
- 
-    .EXAMPLE
-    Enable-Remoting -CredSSPClientDelegateComputer '*'
- 
-    Configures CredSSP/Default on HTTP and HTTPS protocols using self-signed certificate with subject name = $env:COMPUTERNAME
-    and additionally configures CredSSP client role to be able to forward credentials to any computer.
- 
-    .EXAMPLE
-    Enable-Remoting -CertSubjectName '192.168.1.200'
-     
-    Configures CredSSP/Default on HTTP and HTTPS protocols using self-signed certificate with subject name = 192.168.1.200.
- 
-    .EXAMPLE
-    Enable-Remoting -AuthTypes 'Default' -Protocols 'HTTPS' -CertSelfSigned:$false -CertThumbprint $thumbprint
- 
-    Configures Default on HTTPS using provided certificate thumbprint.
-    #>
+# Written by Trond Hindenes <trond@hindenes.com>
+# Updated by Chris Church <cchurch@ansible.com>
+# Updated by Michael Crilly <mike@autologic.cm>
+# Updated by Anton Ouzounov <Anton.Ouzounov@careerbuilder.com>
+# Updated by Nicolas Simond <contact@nicolas-simond.com>
+# Updated by Dag Wieërs <dag@wieers.com>
+# Updated by Jordan Borean <jborean93@gmail.com>
+# Updated by Erwan Quélin <erwan.quelin@gmail.com>
+# Updated by David Norman <david@dkn.email>
+#
+# Version 1.0 - 2014-07-06
+# Version 1.1 - 2014-11-11
+# Version 1.2 - 2015-05-15
+# Version 1.3 - 2016-04-04
+# Version 1.4 - 2017-01-05
+# Version 1.5 - 2017-02-09
+# Version 1.6 - 2017-04-18
+# Version 1.7 - 2017-11-23
+# Version 1.8 - 2018-02-23
+# Version 1.9 - 2018-09-21
 
-    [CmdletBinding()]
-    [OutputType([void])]
-    param(
-        [Parameter(Mandatory=$false)]
-        [string[]] 
-        [ValidateSet('Basic', 'CredSSP', 'Default')]
-        $AuthTypes = @('Default'),
-        
-        [Parameter(Mandatory=$false)]
-        [string[]] 
-        [ValidateSet('HTTP', 'HTTPS')]
-        $Protocols = @('HTTP', 'HTTPS'),
+# Support -Verbose option
+[CmdletBinding()]
 
-        [Parameter(Mandatory=$false)]
-        [string[]] 
-        $CredSSPClientDelegateComputer,
+Param (
+    [string]$SubjectName = $env:COMPUTERNAME,
+    [int]$CertValidityDays = 1095,
+    [switch]$SkipNetworkProfileCheck,
+    $CreateSelfSignedCert = $true,
+    [switch]$ForceNewSSLCert,
+    [switch]$GlobalHttpFirewallAccess,
+    [switch]$DisableBasicAuth = $false,
+    [switch]$EnableCredSSP
+)
 
-        [Parameter(Mandatory=$false)]
-        [switch] 
-        $CertSelfSigned = $true,
-
-        [Parameter(Mandatory=$false)]
-        [string] 
-        $CertThumbprint,
-
-        [Parameter(Mandatory=$false)]
-        [string]
-        $CertSubjectName = $env:COMPUTERNAME        
-    )
-
-    $ErrorActionPreference = "Stop"
-
-    if ($CertSelfSigned -and $CertThumbprint) {
-        Write-Error 'Both CertSelfSigned and CertThumbprint cannot be specified. If you have a certificate, please pass -CertSelfSigned:$false.'
-    }
-    if (!$CertSelfSigned -and !$CertThumbprint) {
-        Write-Error 'CertSelfSigned must be $true if CertThumbprint is empty. If you have a certificate, please pass -CertSelfSigned:$false and valid CertThumbprint. Otherwise, please pass CertSelfSigned:$true.'
-    }
-
-    # Detect PowerShell version
-    if ($PSVersionTable.PSVersion.Major -lt 3) {
-        Write-Error "PowerShell/Windows Management Framework needs to be updated to 3 or higher. Stopping script"
-    }
-
-    if (!(Get-PSSessionConfiguration -verbose:$false) -or (!(Get-ChildItem -Path WSMan:\localhost\Listener))){
-        Write-Output "Enabling PSRemoting"
-        Enable-PSRemoting -Force -ErrorAction SilentlyContinue
-    } else {
-        Write-Output "PS remoting is already active."
-    }
-
-    $listeners = Get-ChildItem -Path WSMan:\localhost\Listener
-
-    $httpListener = $listeners | where { $_.Keys -like "TRANSPORT=HTTP" }
-    if ($Protocols -icontains "HTTP" -and !$httpListener) {
-        Write-Output "Creating HTTP listener for hostname '$CertSubjectName'"
-        [void](New-WSManInstance -ResourceURI 'winrm/config/Listener' -SelectorSet @{Transport = 'HTTP'; Address = '*'})
-        $httpListener = $listeners | where { $_.Keys -like "TRANSPORT=HTTP" }
-    } elseif ($Protocols -icontains "HTTP") {
-        $httpListenerEnabled = if ($httpListener) { "enabled" } else { "disabled" }
-        Write-Output "HTTP listener already $httpListenerEnabled."
-    }
-
-    $httpsListener = $listeners | where { $_.Keys -like "TRANSPORT=HTTPS" }
-    if ($Protocols -icontains "HTTPS" -and !$httpsListener) {
-       Enable-HTTPSRemoting -CertSelfSigned:$CertSelfSigned -CertThumbprint $CertThumbprint -CertSubjectName $CertSubjectName
-       $httpsListener = $listeners | where { $_.Keys -like "TRANSPORT=HTTPS" }
-    } elseif ($Protocols -icontains "HTTPS") {
-        $httpsListenerEnabled = if ($httpsListener) { "enabled" } else { "disabled" }
-        Write-Output "HTTPS listener already $httpsListenerEnabled."
-    }
-
-    if ($Protocols -icontains "HTTPS") {
-        $firewallRuleName = 'Allow WinRM HTTPS'  
-        
-        if (Get-Command -Name 'Get-NetFirewallRule' -ErrorAction SilentlyContinue) {
-            if (!(Get-NetFirewallRule -Name $firewallRuleName -ErrorAction SilentlyContinue)) {
-                Write-Output "Creating firewall rule '$firewallRuleName' for port 5986."
-                [void](New-NetFirewallRule -Name $firewallRuleName -DisplayName $firewallRuleName -Action Allow -LocalPort 5986 -Profile Any -Direction Inbound -Protocol TCP)
-            } else {
-                Write-Output "Firewall rule '$firewallRuleName' already exists."
-            }
-        } else {
-            $currentRule = & netsh advfirewall firewall show rule name="$firewallRuleName"
-            if ($currentRule -match 'No rules match') {
-                Write-Output "Creating firewall rule '$firewallRuleName' for port 5986."
-                & netsh advfirewall firewall add rule name="$firewallRuleName" dir=in action=allow protocol=TCP localport=5986 profile=any
-            } else {
-               Write-Output "Firewall rule '$firewallRuleName' already exists."
-            }
-        }
-
-    }
-
-    if ($AuthTypes -icontains "Basic") {
-        Set-AuthType -AuthType "Basic" -Enable
-    }
-    if ($AuthTypes -icontains "Default") {
-        Set-AuthType -AuthType "Negotiate" -Enable
-        Set-AuthType -AuthType "Kerberos" -Enable
-    }
-    if ($AuthTypes -icontains "CredSSP") {
-        Set-AuthType -AuthType "CredSSP" -Enable
-    }
-
-    if ($CredSSPClientDelegateComputer) {
-        Write-Output "Enabling CredSSP client role with following -DelegateComputer: $CredSSPClientDelegateComputer"
-        [void](Enable-WSManCredSSP -Role Client -DelegateComputer $CredSSPClientDelegateComputer -Force)
-    }
-
-    Test-PSRemoting -AuthTypes $AuthTypes -Protocols $Protocols -ComputerName $CertSubjectName
-
+Function Write-Log
+{
+    $Message = $args[0]
+    Write-EventLog -LogName Application -Source $EventSource -EntryType Information -EventId 1 -Message $Message
 }
 
-function Set-RenewedSelfSignedCertificate {
-    
-    <#
-    .SYNOPSIS
-    Renews self-signed certificate on HTTPS.
- 
-    .PARAMETER CertSubjectName
-    Subject name for the certificate (if AuthTypes contains HTTPS). It must be the same string as the one used to connect to this server.
-    For example if you're going to run Invoke-Command -ComputerName 192.168.1.50, subject name must be 192.168.1.50.
- 
-    .EXAMPLE
-    Set-RenewedSelfSignedCertificate -CertSubjectName $CertSubjectName
- 
-    #>
-
-    [CmdletBinding()]
-    [OutputType([void])]
-    param(
-        [Parameter(Mandatory=$false)]
-        [string]
-        $CertSubjectName = $env:COMPUTERNAME
-    )
-
-    $ErrorActionPreference = "Stop"
-
-    $selectorset = @{}
-    $selectorset.add('Transport','HTTPS')
-    $selectorset.add('Address','*')
-
-    try { 
-        $wsManInstance = Get-WSManInstance -ResourceUri 'winrm/config/Listener' -SelectorSet $selectorset -ErrorAction SilentlyContinue
-    } catch { }
-    if (!$wsManInstance) {
-        throw "HTTPS has not been enabled yet. Please enable it before renewing self-seigned certificate."
-    }
-    $oldCertThumbprint = $wsManInstance.CertificateThumbprint
-    $newCertThumbprint = Get-NewSelfSignedCertificate -CertSubjectName $CertSubjectName
-
-    $valueset = @{}
-    $valueset.add('Hostname', $CertSubjectName)
-    $valueset.add('CertificateThumbprint', $newCertThumbprint)
-    Write-Output "Configuring HTTPS listener."
-    [void](Set-WsManInstance -ResourceURI 'winrm/config/Listener' -SelectorSet $selectorset -ValueSet $valueset)
-    Write-Output "Certificate successfully updated from $oldCertThumbprint to $newCertThumbprint."
+Function Write-VerboseLog
+{
+    $Message = $args[0]
+    Write-Verbose $Message
+    Write-Log $Message
 }
 
-
-function Set-AuthType {
-
-    <#
-    .SYNOPSIS
-    Enables / disables provided authentication method in PSRemoting.
-     
-    .PARAMETER AuthType
-    Type of authentication to set.
- 
-    .PARAMETER Enable
-    Whether to enable or disable the authentication method.
- 
-    .EXAMPLE
-    Set-AuthType -AuthType "Basic" -Enable
-    #>
-
-    [CmdletBinding()]
-    [OutputType([void])]
-    param(
-        [Parameter(Mandatory=$true)]
-        [string] 
-        [ValidateSet('Basic', 'CredSSP', 'Negotiate', 'Kerberos')]
-        $AuthType,
-
-        [Parameter(Mandatory=$false)]
-        [switch] 
-        $Enable
-    ) 
-
-    $authEnabled = Get-ChildItem -Path WSMan:\localhost\Service\Auth | Where-Object { $_.Name -eq $AuthType } | Select -ExpandProperty Value
-    if ($Enable -and !$authEnabled) {
-        Write-Output "Enabling authentication method '$AuthType'"
-        Set-Item -Path "WSMan:\localhost\Service\Auth\$AuthType" -Value $true
-    } elseif ($AuthTypes -inotcontains "Basic" -and $basicAuth) {
-        Write-Output "Disabling authentication method '$AuthType'"
-        Set-Item -Path "WSMan:\localhost\Service\Auth\$AuthType" -Value $false
-    } else {
-        $authEnabled = if ($Enable) { "enabled" } else { "disabled" }
-        Write-Output "Authentication method '$AuthType' already $authEnabled."
-    }
-
+Function Write-HostLog
+{
+    $Message = $args[0]
+    Write-Output $Message
+    Write-Log $Message
 }
 
-function Enable-HTTPSRemoting {
- 
-    <#
-    .SYNOPSIS
-    Enables HTTPS remoting.
-     
-    .PARAMETER CertSelfSigned
-    If true and HTTPS is configured, a self-signed certificate will be created. Note it's validity is 365 days.
- 
-    .PARAMETER CertThumbprint
-    Thumbprint of certificate to import (if AuthTypes contains HTTPS and CertSelfSigned is false).
- 
-    .PARAMETER CertSubjectName
-    Subject name for the certificate (if AuthTypes contains HTTPS). It must be the same string as the one used to connect to this server.
-    For example if you're going to run Invoke-Command -ComputerName 192.168.1.50, subject name must be 192.168.1.50.
- 
-    .PARAMETER RefreshSelfSignedCert
-    If true and HTTPS is configured and self-signed certificate already exists, it will be renewed.
- 
-    .EXAMPLE
-    Enable-HTTPSRemoting -CertSelfSigned:$CertSelfSigned -CertThumbprint $CertThumbprint -CertSubjectName $CertSubjectName
-    #>
-
-    [CmdletBinding()]
-    [OutputType([void])]
-    param(
-        [Parameter(Mandatory=$false)]
-        [switch] 
-        $CertSelfSigned,
-
-        [Parameter(Mandatory=$false)]
-        [string] 
-        $CertThumbprint,
-
-        [Parameter(Mandatory=$true)]
-        [string]
-        $CertSubjectName
-    )
-
-    if ($CertSelfSigned) {
-        $CertThumbprint = Get-NewSelfSignedCertificate -CertSubjectName $CertSubjectName
-    }
-    
-    # Create the hashtables of settings to be used.
-    $valueset = @{}
-    $valueset.add('Hostname', $CertSubjectName)
-    $valueset.add('CertificateThumbprint', $CertThumbprint)
-
-    $selectorset = @{}
-    $selectorset.add('Transport','HTTPS')
-    $selectorset.add('Address','*')
-    
-    Write-Output "Creating HTTPS listener for hostname '$CertSubjectName'"
-    [void](New-WSManInstance -ResourceURI 'winrm/config/Listener' -SelectorSet $selectorset -ValueSet $valueset)
-}
-
-function Get-NewSelfSignedCertificate {
-
-    <#
-    .SYNOPSIS
-    Creates a new self-signed certificate.
- 
-    .PARAMETER CertSubjectName
-    Subject name for the certificate (if AuthTypes contains HTTPS). It must be the same string as the one used to connect to this server.
-    For example if you're going to run Invoke-Command -ComputerName 192.168.1.50, subject name must be 192.168.1.50.
- 
-    .EXAMPLE
-    $CertThumbprint = Get-NewSelfSignedCertificate -CertSubjectName $CertSubjectName
-    #>
-    [CmdletBinding()]
-    [OutputType([string])]
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]
-        $CertSubjectName
-    )
-
-    # < Windows Server 2012 -> need legacy way to create self-signed certificate
-    if ([Environment]::OSVersion.Version.Major -lt 6 -or ([Environment]::OSVersion.Version.Major -eq 6 -and [Environment]::OSVersion.Version.Minor -lt 2)) {
-        $legacyOS = $true
-    } else {
-        $legacyOS = $false
-    }
-
-    if ($legacyOS) {
-        Write-Host "Creating new self-signed certificate in legacy mode (< Windows Server 2012)"
-        $CertThumbprint = New-LegacySelfSignedCert -SubjectName $CertSubjectName
-    } else {
-        Write-Host "Creating new self-signed certificate"
-        $cert = New-SelfSignedCertificate -DnsName $CertSubjectName -CertStoreLocation "Cert:\LocalMachine\My"
-        $CertThumbprint = $cert.Thumbprint
-    } 
-
-    return $CertThumbprint
-}
-
-
-function New-LegacySelfSignedCert {
-
-    <#
-    .SYNOPSIS
-    Creates a new self-signed certificate using legacy methods.
- 
-    .DESCRIPTION
-    Taken from script for Ansible written by Trond Hindenes <trond@hindenes.com> (Version 1.0 - July 6th, 2014)
-    https://github.com/ansible/ansible/blob/devel/examples/scripts/ConfigureRemotingForAnsible.ps1
-     
-    .PARAMETER SubjectName
-    Subject name for the certificate.
- 
-    .PARAMETER ValidDays
-    Duration of certificate validity.
- 
-    .EXAMPLE
-    $CertThumbprint = New-LegacySelfSignedCert -SubjectName $CertSubjectName
-    #>
-    
-    [CmdletBinding()]
-    [OutputType([void])]
+Function New-LegacySelfSignedCert
+{
     Param (
         [string]$SubjectName,
-        [int]$ValidDays = 365
+        [int]$ValidDays = 1095
     )
-    
-    $name = new-object -com "X509Enrollment.CX500DistinguishedName.1"
+
+    $hostnonFQDN = $env:computerName
+    $hostFQDN = [System.Net.Dns]::GetHostByName(($env:computerName)).Hostname
+    $SignatureAlgorithm = "SHA256"
+
+    $name = New-Object -COM "X509Enrollment.CX500DistinguishedName.1"
     $name.Encode("CN=$SubjectName", 0)
 
-    $key = new-object -com "X509Enrollment.CX509PrivateKey.1"
-    $key.ProviderName = "Microsoft RSA SChannel Cryptographic Provider"
+    $key = New-Object -COM "X509Enrollment.CX509PrivateKey.1"
+    $key.ProviderName = "Microsoft Enhanced RSA and AES Cryptographic Provider"
     $key.KeySpec = 1
-    $key.Length = 1024
+    $key.Length = 4096
     $key.SecurityDescriptor = "D:PAI(A;;0xd01f01ff;;;SY)(A;;0xd01f01ff;;;BA)(A;;0x80120089;;;NS)"
     $key.MachineContext = 1
     $key.Create()
 
-    $serverauthoid = new-object -com "X509Enrollment.CObjectId.1"
+    $serverauthoid = New-Object -COM "X509Enrollment.CObjectId.1"
     $serverauthoid.InitializeFromValue("1.3.6.1.5.5.7.3.1")
-    $ekuoids = new-object -com "X509Enrollment.CObjectIds.1"
-    $ekuoids.add($serverauthoid)
-    $ekuext = new-object -com "X509Enrollment.CX509ExtensionEnhancedKeyUsage.1"
+    $ekuoids = New-Object -COM "X509Enrollment.CObjectIds.1"
+    $ekuoids.Add($serverauthoid)
+    $ekuext = New-Object -COM "X509Enrollment.CX509ExtensionEnhancedKeyUsage.1"
     $ekuext.InitializeEncode($ekuoids)
 
-    $cert = new-object -com "X509Enrollment.CX509CertificateRequestCertificate.1"
+    $cert = New-Object -COM "X509Enrollment.CX509CertificateRequestCertificate.1"
     $cert.InitializeFromPrivateKey(2, $key, "")
     $cert.Subject = $name
     $cert.Issuer = $cert.Subject
-    $cert.NotBefore = (get-date).addDays(-1)
+    $cert.NotBefore = (Get-Date).AddDays(-1)
     $cert.NotAfter = $cert.NotBefore.AddDays($ValidDays)
+
+    $SigOID = New-Object -ComObject X509Enrollment.CObjectId
+    $SigOID.InitializeFromValue(([Security.Cryptography.Oid]$SignatureAlgorithm).Value)
+
+    [string[]] $AlternativeName  += $hostnonFQDN
+    $AlternativeName += $hostFQDN
+    $IAlternativeNames = New-Object -ComObject X509Enrollment.CAlternativeNames
+
+    foreach ($AN in $AlternativeName)
+    {
+        $AltName = New-Object -ComObject X509Enrollment.CAlternativeName
+        $AltName.InitializeFromString(0x3,$AN)
+        $IAlternativeNames.Add($AltName)
+    }
+
+    $SubjectAlternativeName = New-Object -ComObject X509Enrollment.CX509ExtensionAlternativeNames
+    $SubjectAlternativeName.InitializeEncode($IAlternativeNames)
+
+    [String[]]$KeyUsage = ("DigitalSignature", "KeyEncipherment")
+    $KeyUsageObj = New-Object -ComObject X509Enrollment.CX509ExtensionKeyUsage
+    $KeyUsageObj.InitializeEncode([int][Security.Cryptography.X509Certificates.X509KeyUsageFlags]($KeyUsage))
+    $KeyUsageObj.Critical = $true
+
+    $cert.X509Extensions.Add($KeyUsageObj)
     $cert.X509Extensions.Add($ekuext)
+    $cert.SignatureInformation.HashAlgorithm = $SigOID
+    $CERT.X509Extensions.Add($SubjectAlternativeName)
     $cert.Encode()
 
-    $enrollment = new-object -com "X509Enrollment.CX509Enrollment.1"
+    $enrollment = New-Object -COM "X509Enrollment.CX509Enrollment.1"
     $enrollment.InitializeFromRequest($cert)
     $certdata = $enrollment.CreateRequest(0)
     $enrollment.InstallResponse(2, $certdata, 0, "")
 
-    #return the thumprint of the last installed cert
-    ls "Cert:\LocalMachine\my"| Where-Object { $_.Subject -eq "CN=$SubjectName" } | Sort-Object notbefore -Descending | select -First 1 | select -expand Thumbprint
+    # extract/return the thumbprint from the generated cert
+    $parsed_cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2
+    $parsed_cert.Import([System.Text.Encoding]::UTF8.GetBytes($certdata))
+
+    return $parsed_cert.Thumbprint
 }
+
+Function Enable-GlobalHttpFirewallAccess
+{
+    Write-Verbose "Forcing global HTTP firewall access"
+    # this is a fairly naive implementation; could be more sophisticated about rule matching/collapsing
+    $fw = New-Object -ComObject HNetCfg.FWPolicy2
+
+    # try to find/enable the default rule first
+    $add_rule = $false
+    $matching_rules = $fw.Rules | ? { $_.Name -eq "Windows Remote Management (HTTP-In)" }
+    $rule = $null
+    If ($matching_rules) {
+        If ($matching_rules -isnot [Array]) {
+            Write-Verbose "Editing existing single HTTP firewall rule"
+            $rule = $matching_rules
+        }
+        Else {
+            # try to find one with the All or Public profile first
+            Write-Verbose "Found multiple existing HTTP firewall rules..."
+            $rule = $matching_rules | % { $_.Profiles -band 4 }[0]
+
+            If (-not $rule -or $rule -is [Array]) {
+                Write-Verbose "Editing an arbitrary single HTTP firewall rule (multiple existed)"
+                # oh well, just pick the first one
+                $rule = $matching_rules[0]
+            }
+        }
+    }
+
+    If (-not $rule) {
+        Write-Verbose "Creating a new HTTP firewall rule"
+        $rule = New-Object -ComObject HNetCfg.FWRule
+        $rule.Name = "Windows Remote Management (HTTP-In)"
+        $rule.Description = "Inbound rule for Windows Remote Management via WS-Management. [TCP 5985]"
+        $add_rule = $true
+    }
+
+    $rule.Profiles = 0x7FFFFFFF
+    $rule.Protocol = 6
+    $rule.LocalPorts = 5985
+    $rule.RemotePorts = "*"
+    $rule.LocalAddresses = "*"
+    $rule.RemoteAddresses = "*"
+    $rule.Enabled = $true
+    $rule.Direction = 1
+    $rule.Action = 1
+    $rule.Grouping = "Windows Remote Management"
+
+    If ($add_rule) {
+        $fw.Rules.Add($rule)
+    }
+
+    Write-Verbose "HTTP firewall rule $($rule.Name) updated"
+}
+
+# Setup error handling.
+Trap
+{
+    $_
+    Exit 1
+}
+$ErrorActionPreference = "Stop"
+
+# Get the ID and security principal of the current user account
+$myWindowsID=[System.Security.Principal.WindowsIdentity]::GetCurrent()
+$myWindowsPrincipal=new-object System.Security.Principal.WindowsPrincipal($myWindowsID)
+
+# Get the security principal for the Administrator role
+$adminRole=[System.Security.Principal.WindowsBuiltInRole]::Administrator
+
+# Check to see if we are currently running "as Administrator"
+if (-Not $myWindowsPrincipal.IsInRole($adminRole))
+{
+    Write-Output "ERROR: You need elevated Administrator privileges in order to run this script."
+    Write-Output "       Start Windows PowerShell by using the Run as Administrator option."
+    Exit 2
+}
+
+$EventSource = $MyInvocation.MyCommand.Name
+If (-Not $EventSource)
+{
+    $EventSource = "Powershell CLI"
+}
+
+If ([System.Diagnostics.EventLog]::Exists('Application') -eq $False -or [System.Diagnostics.EventLog]::SourceExists($EventSource) -eq $False)
+{
+    New-EventLog -LogName Application -Source $EventSource
+}
+
+# Detect PowerShell version.
+If ($PSVersionTable.PSVersion.Major -lt 3)
+{
+    Write-Log "PowerShell version 3 or higher is required."
+    Throw "PowerShell version 3 or higher is required."
+}
+
+# Find and start the WinRM service.
+Write-Verbose "Verifying WinRM service."
+If (!(Get-Service "WinRM"))
+{
+    Write-Log "Unable to find the WinRM service."
+    Throw "Unable to find the WinRM service."
+}
+ElseIf ((Get-Service "WinRM").Status -ne "Running")
+{
+    Write-Verbose "Setting WinRM service to start automatically on boot."
+    Set-Service -Name "WinRM" -StartupType Automatic
+    Write-Log "Set WinRM service to start automatically on boot."
+    Write-Verbose "Starting WinRM service."
+    Start-Service -Name "WinRM" -ErrorAction Stop
+    Write-Log "Started WinRM service."
+
+}
+
+# WinRM should be running; check that we have a PS session config.
+If (!(Get-PSSessionConfiguration -Verbose:$false) -or (!(Get-ChildItem WSMan:\localhost\Listener)))
+{
+  If ($SkipNetworkProfileCheck) {
+    Write-Verbose "Enabling PS Remoting without checking Network profile."
+    Enable-PSRemoting -SkipNetworkProfileCheck -Force -ErrorAction Stop
+    Write-Log "Enabled PS Remoting without checking Network profile."
+  }
+  Else {
+    Write-Verbose "Enabling PS Remoting."
+    Enable-PSRemoting -Force -ErrorAction Stop
+    Write-Log "Enabled PS Remoting."
+  }
+}
+Else
+{
+    Write-Verbose "PS Remoting is already enabled."
+}
+
+# Ensure LocalAccountTokenFilterPolicy is set to 1
+# https://github.com/ansible/ansible/issues/42978
+$token_path = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+$token_prop_name = "LocalAccountTokenFilterPolicy"
+$token_key = Get-Item -Path $token_path
+$token_value = $token_key.GetValue($token_prop_name, $null)
+if ($token_value -ne 1) {
+    Write-Verbose "Setting LocalAccountTOkenFilterPolicy to 1"
+    if ($null -ne $token_value) {
+        Remove-ItemProperty -Path $token_path -Name $token_prop_name
+    }
+    New-ItemProperty -Path $token_path -Name $token_prop_name -Value 1 -PropertyType DWORD > $null
+}
+
+# Make sure there is a SSL listener.
+$listeners = Get-ChildItem WSMan:\localhost\Listener
+If (!($listeners | Where {$_.Keys -like "TRANSPORT=HTTPS"}))
+{
+    # We cannot use New-SelfSignedCertificate on 2012R2 and earlier
+    $thumbprint = New-LegacySelfSignedCert -SubjectName $SubjectName -ValidDays $CertValidityDays
+    Write-HostLog "Self-signed SSL certificate generated; thumbprint: $thumbprint"
+
+    # Create the hashtables of settings to be used.
+    $valueset = @{
+        Hostname = $SubjectName
+        CertificateThumbprint = $thumbprint
+    }
+
+    $selectorset = @{
+        Transport = "HTTPS"
+        Address = "*"
+    }
+
+    Write-Verbose "Enabling SSL listener."
+    New-WSManInstance -ResourceURI 'winrm/config/Listener' -SelectorSet $selectorset -ValueSet $valueset
+    Write-Log "Enabled SSL listener."
+}
+Else
+{
+    Write-Verbose "SSL listener is already active."
+
+    # Force a new SSL cert on Listener if the $ForceNewSSLCert
+    If ($ForceNewSSLCert)
+    {
+
+        # We cannot use New-SelfSignedCertificate on 2012R2 and earlier
+        $thumbprint = New-LegacySelfSignedCert -SubjectName $SubjectName -ValidDays $CertValidityDays
+        Write-HostLog "Self-signed SSL certificate generated; thumbprint: $thumbprint"
+
+        $valueset = @{
+            CertificateThumbprint = $thumbprint
+            Hostname = $SubjectName
+        }
+
+        # Delete the listener for SSL
+        $selectorset = @{
+            Address = "*"
+            Transport = "HTTPS"
+        }
+        Remove-WSManInstance -ResourceURI 'winrm/config/Listener' -SelectorSet $selectorset
+
+        # Add new Listener with new SSL cert
+        New-WSManInstance -ResourceURI 'winrm/config/Listener' -SelectorSet $selectorset -ValueSet $valueset
+    }
+}
+
+# Check for basic authentication.
+$basicAuthSetting = Get-ChildItem WSMan:\localhost\Service\Auth | Where-Object {$_.Name -eq "Basic"}
+
+If ($DisableBasicAuth)
+{
+    If (($basicAuthSetting.Value) -eq $true)
+    {
+        Write-Verbose "Disabling basic auth support."
+        Set-Item -Path "WSMan:\localhost\Service\Auth\Basic" -Value $false
+        Write-Log "Disabled basic auth support."
+    }
+    Else
+    {
+        Write-Verbose "Basic auth is already disabled."
+    }
+}
+Else
+{
+    If (($basicAuthSetting.Value) -eq $false)
+    {
+        Write-Verbose "Enabling basic auth support."
+        Set-Item -Path "WSMan:\localhost\Service\Auth\Basic" -Value $true
+        Write-Log "Enabled basic auth support."
+    }
+    Else
+    {
+        Write-Verbose "Basic auth is already enabled."
+    }
+}
+
+# If EnableCredSSP if set to true
+If ($EnableCredSSP)
+{
+    # Check for CredSSP authentication
+    $credsspAuthSetting = Get-ChildItem WSMan:\localhost\Service\Auth | Where {$_.Name -eq "CredSSP"}
+    If (($credsspAuthSetting.Value) -eq $false)
+    {
+        Write-Verbose "Enabling CredSSP auth support."
+        Enable-WSManCredSSP -role server -Force
+        Write-Log "Enabled CredSSP auth support."
+    }
+}
+
+If ($GlobalHttpFirewallAccess) {
+    Enable-GlobalHttpFirewallAccess
+}
+
+# Configure firewall to allow WinRM HTTPS connections.
+$fwtest1 = netsh advfirewall firewall show rule name="Allow WinRM HTTPS"
+$fwtest2 = netsh advfirewall firewall show rule name="Allow WinRM HTTPS" profile=any
+If ($fwtest1.count -lt 5)
+{
+    Write-Verbose "Adding firewall rule to allow WinRM HTTPS."
+    netsh advfirewall firewall add rule profile=any name="Allow WinRM HTTPS" dir=in localport=5986 protocol=TCP action=allow
+    Write-Log "Added firewall rule to allow WinRM HTTPS."
+}
+ElseIf (($fwtest1.count -ge 5) -and ($fwtest2.count -lt 5))
+{
+    Write-Verbose "Updating firewall rule to allow WinRM HTTPS for any profile."
+    netsh advfirewall firewall set rule name="Allow WinRM HTTPS" new profile=any
+    Write-Log "Updated firewall rule to allow WinRM HTTPS for any profile."
+}
+Else
+{
+    Write-Verbose "Firewall rule already exists to allow WinRM HTTPS."
+}
+
+# Test a remoting connection to localhost, which should work.
+$httpResult = Invoke-Command -ComputerName "localhost" -ScriptBlock {$env:COMPUTERNAME} -ErrorVariable httpError -ErrorAction SilentlyContinue
+$httpsOptions = New-PSSessionOption -SkipCACheck -SkipCNCheck -SkipRevocationCheck
+
+$httpsResult = New-PSSession -UseSSL -ComputerName "localhost" -SessionOption $httpsOptions -ErrorVariable httpsError -ErrorAction SilentlyContinue
+
+If ($httpResult -and $httpsResult)
+{
+    Write-Verbose "HTTP: Enabled | HTTPS: Enabled"
+}
+ElseIf ($httpsResult -and !$httpResult)
+{
+    Write-Verbose "HTTP: Disabled | HTTPS: Enabled"
+}
+ElseIf ($httpResult -and !$httpsResult)
+{
+    Write-Verbose "HTTP: Enabled | HTTPS: Disabled"
+}
+Else
+{
+    Write-Log "Unable to establish an HTTP or HTTPS remoting session."
+    Throw "Unable to establish an HTTP or HTTPS remoting session."
+}
+Write-VerboseLog "PS Remoting has been successfully configured for Ansible."
